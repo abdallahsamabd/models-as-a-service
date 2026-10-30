@@ -2,13 +2,17 @@ package tenantreconcile
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/go-logr/logr"
+	"github.com/google/cel-go/cel"
+	"github.com/google/cel-go/ext"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/yaml"
 
 	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
 	"github.com/opendatahub-io/models-as-a-service/maas-controller/pkg/groupname"
@@ -113,6 +117,7 @@ func TestPatchAuthPolicyWithOIDCTokenContract(t *testing.T) {
 }
 
 func TestBuildTelemetryLabels(t *testing.T) {
+	modelLabel := staticTelemetryModelLabel(t)
 	tests := []struct {
 		name           string
 		config         *maasv1alpha1.TenantTelemetryConfig
@@ -126,7 +131,7 @@ func TestBuildTelemetryLabels(t *testing.T) {
 				"subscription":    "auth.identity.selected_subscription",
 				"cost_center":     `has(auth.identity.subscription_info.costCenter) ? auth.identity.subscription_info.costCenter : ""`,
 				"organization_id": `has(auth.identity.subscription_info.organizationId) ? auth.identity.subscription_info.organizationId : ""`,
-				"model":           "responseBodyJSON(\"/model\")",
+				"model":           modelLabel,
 			},
 			absentKeys: []string{"user", "group"},
 		},
@@ -195,7 +200,7 @@ func TestBuildTelemetryLabels(t *testing.T) {
 				"organization_id": `has(auth.identity.subscription_info.organizationId) ? auth.identity.subscription_info.organizationId : ""`,
 				"user":            "auth.identity.userid",
 				"group":           "auth.identity.groups_str",
-				"model":           "responseBodyJSON(\"/model\")",
+				"model":           modelLabel,
 			},
 		},
 	}
@@ -400,6 +405,56 @@ func TestIsIPPResource(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.expected, isIPPResource(tt.gvk, tt.resName))
+		})
+	}
+}
+
+func staticTelemetryModelLabel(t *testing.T) string {
+	t.Helper()
+	policy, err := os.ReadFile("../../../../deployment/base/observability/gateway-telemetry-policy.yaml")
+	require.NoError(t, err)
+	var object map[string]any
+	require.NoError(t, yaml.Unmarshal(policy, &object))
+	staticExpression, found, err := unstructured.NestedString(object, "spec", "metrics", "default", "labels", "model")
+	require.NoError(t, err)
+	require.True(t, found)
+	return staticExpression
+}
+
+// No response context is provided: errors may have plain-text, HTML or empty
+// bodies, and a backend's model name can differ from the published model alias.
+func TestTelemetryModelLabelUsesPublishedRequestModel(t *testing.T) {
+	expression, ok := buildTelemetryLabels(logr.Discard(), nil)["model"].(string)
+	require.True(t, ok)
+	require.Equal(t, staticTelemetryModelLabel(t), expression, "static and tenant-rendered model labels must stay in sync")
+	env, err := cel.NewEnv(cel.Variable("request", cel.DynType), ext.Strings())
+	require.NoError(t, err)
+	ast, issues := env.Compile(expression)
+	require.NoError(t, issues.Err())
+	program, err := env.Program(ast)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name     string
+		path     string
+		headers  map[string]string
+		expected string
+	}{
+		{"published alias without a response model", "/v1/chat/completions", map[string]string{"x-gateway-model-name": "public-chat"}, "public-chat"},
+		{"publisher model identifier", "/v1/chat/completions", map[string]string{"x-gateway-model-name": "publishers/llm/models/gpu-llama"}, "publishers/llm/models/gpu-llama"},
+		{"path identity overrides a conflicting body model", "/llm/public-chat/v1/chat/completions", map[string]string{"x-gateway-model-name": "unrelated-body-model"}, "llm/public-chat"},
+		{"path identity without a body model", "/llm/public-chat/v1/chat/completions", map[string]string{}, "llm/public-chat"},
+		{"empty path segments follow authorization identity", "//llm//public-chat/v1/chat/completions", map[string]string{}, "llm/public-chat"},
+		{"management request without a model", "/maas-api/v1/models", map[string]string{}, ""},
+		{"catalog request without a model", "/v1/models", map[string]string{}, ""},
+		{"root request without a model", "/", map[string]string{}, ""},
+		{"short path without a model", "/health", map[string]string{}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, _, err := program.Eval(map[string]any{"request": map[string]any{"path": tt.path, "headers": tt.headers}})
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, result.Value())
 		})
 	}
 }

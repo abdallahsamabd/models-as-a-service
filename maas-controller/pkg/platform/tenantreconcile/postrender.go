@@ -544,7 +544,12 @@ func buildTelemetryLabels(log logr.Logger, config *maasv1alpha1.TenantTelemetryC
 		labels["group"] = "auth.identity.groups_str"
 	}
 	if captureModelUsage {
-		labels["model"] = "responseBodyJSON(\"/model\")"
+		// Match authorization's path-first identity: a conflicting body model
+		// must not relabel a path-routed request. Body routing uses the header
+		// extracted before provider rewriting, without requiring a response model.
+		parts := `request.path.split("/").filter(x, x != "")`
+		pathIdentityAvailable := `size(` + parts + `) >= 2 && ` + parts + `[0] != "v1" && ` + parts + `[0] != "maas-api"`
+		labels["model"] = `(` + pathIdentityAvailable + ` ? ` + parts + `[0] + "/" + ` + parts + `[1] : ("x-gateway-model-name" in request.headers ? request.headers["x-gateway-model-name"] : ""))`
 	}
 	return labels
 }
